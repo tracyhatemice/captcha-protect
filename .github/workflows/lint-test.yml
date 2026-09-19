@@ -115,3 +115,32 @@ jobs:
         if: ${{ always() }}
         run: docker compose down
         working-directory: ./ci
+
+  integration-test-cap:
+    needs: [run]
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        traefik: [v3.6, latest]
+    env:
+      TRAEFIK_TAG: ${{ matrix.traefik }}
+      CAP_E2E_PORT: "80"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: run
+        run: go run ./cap
+        working-directory: ./ci
+
+      - name: capture logs
+        if: ${{ always() }}
+        run: docker compose -f docker-compose.cap.yml logs --tail 200 cap traefik
+        working-directory: ./ci
+
+      - name: cleanup
+        if: ${{ always() }}
+        run: docker compose -f docker-compose.cap.yml down -v
+        working-directory: ./ci
