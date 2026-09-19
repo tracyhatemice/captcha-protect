@@ -1,12 +1,14 @@
 package captcha_protect
 
 import (
+	"bytes"
 	"context"
 	crand "crypto/rand"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	htemplate "html/template"
+	"io"
 	"log/slog"
 	"math/big"
 	"net"
@@ -39,6 +41,7 @@ const (
 	goodBotLookupTimeout               = 2 * time.Second
 	maxCaptchaChallengeAge             = 5 * time.Minute
 	turnstileTestHostname              = "example.com"
+	capJSPath                          = "/captcha-protect-cap.js"
 )
 
 var turnstileTestSiteKeys = map[string]struct{}{
@@ -82,6 +85,10 @@ type Config struct {
 	CaptchaProvider       string   `json:"captchaProvider"`
 	SiteKey               string   `json:"siteKey"`
 	SecretKey             string   `json:"secretKey"`
+	// CapURL is the base URL of a self-hosted Cap instance as the browser sees it.
+	CapURL string `json:"capURL"`
+	// CapVerifyURL is the base URL the middleware uses to call Cap's siteverify endpoint.
+	CapVerifyURL string `json:"capVerifyURL"`
 	// EnableStatsPage is a string instead of bool due to Traefik's label parsing limitations
 	EnableStatsPage          string `json:"enableStatsPage"`
 	LogLevel                 string `json:"loglevel,omitempty"`
@@ -106,6 +113,7 @@ type CaptchaProtect struct {
 	commonCrawlIPs     *helper.CommonCrawlIPs
 	uptimeRobotIPs     *helper.UptimeRobotIPs
 	captchaConfig      CaptchaConfig
+	capJS              string
 	exemptIps          []*net.IPNet
 	tmpl               *htemplate.Template
 	protectRoutesRegex []*regexp.Regexp
@@ -126,6 +134,16 @@ type CaptchaConfig struct {
 	js       string
 	key      string
 	validate string
+	// healthURL overrides js as the circuit-breaker health check target.
+	healthURL string
+}
+
+// healthCheckURL returns the URL the circuit breaker probes for this provider.
+func (c CaptchaConfig) healthCheckURL() string {
+	if c.healthURL != "" {
+		return c.healthURL
+	}
+	return c.js
 }
 
 type captchaResponse struct {
@@ -320,7 +338,16 @@ func NewCaptchaProtect(ctx context.Context, next http.Handler, config *Config, n
 	// set the captcha config based on the provider
 	// thanks to https://github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin/blob/4708d76854c7ae95fa7313c46fbe21959be2fff1/pkg/captcha/captcha.go#L39-L55
 	// for the struct/idea
-	bc.captchaConfig = getCaptchaConfig(config.CaptchaProvider)
+	if config.CaptchaProvider == "cap" {
+		capConfig, err := newCapCaptchaConfig(config)
+		if err != nil {
+			return nil, err
+		}
+		bc.captchaConfig = capConfig
+		bc.capJS = helper.GetCapJS(config.CapURL)
+	} else {
+		bc.captchaConfig = getCaptchaConfig(config.CaptchaProvider)
+	}
 	if bc.captchaConfig.js == "" {
 		return nil, fmt.Errorf("invalid captcha provider: %s", config.CaptchaProvider)
 	}
@@ -482,6 +509,53 @@ func getCaptchaConfig(provider string) CaptchaConfig {
 	}
 }
 
+// newCapCaptchaConfig validates the self-hosted Cap settings, normalizes them in place, and
+// returns the provider config. capURL is used by the browser; capVerifyURL by the middleware.
+func newCapCaptchaConfig(config *Config) (CaptchaConfig, error) {
+	capURL := strings.TrimRight(strings.TrimSpace(config.CapURL), "/")
+	if capURL == "" {
+		return CaptchaConfig{}, fmt.Errorf("capURL is required when captchaProvider is cap (e.g. /cap)")
+	}
+	capIsAbsolute := isHTTPURL(capURL)
+	if !capIsAbsolute && !isRootRelativePath(capURL) {
+		return CaptchaConfig{}, fmt.Errorf("capURL must be a root-relative path or an absolute http(s) URL, got %q", config.CapURL)
+	}
+
+	verifyURL := strings.TrimRight(strings.TrimSpace(config.CapVerifyURL), "/")
+	if verifyURL == "" {
+		if !capIsAbsolute {
+			return CaptchaConfig{}, fmt.Errorf("capVerifyURL is required when capURL is a relative path")
+		}
+		verifyURL = capURL
+	}
+	if !isHTTPURL(verifyURL) {
+		return CaptchaConfig{}, fmt.Errorf("capVerifyURL must be an absolute http(s) URL, got %q", config.CapVerifyURL)
+	}
+
+	config.CapURL = capURL
+	config.CapVerifyURL = verifyURL
+
+	return CaptchaConfig{
+		js:        capJSPath,
+		key:       "cap",
+		validate:  fmt.Sprintf("%s/%s/siteverify", verifyURL, url.PathEscape(config.SiteKey)),
+		healthURL: verifyURL + "/assets/widget.js",
+	}, nil
+}
+
+func isHTTPURL(s string) bool {
+	u, err := url.Parse(s)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" && u.RawQuery == "" && u.Fragment == ""
+}
+
+func isRootRelativePath(s string) bool {
+	if !strings.HasPrefix(s, "/") || strings.HasPrefix(s, "//") {
+		return false
+	}
+	u, err := url.Parse(s)
+	return err == nil && u.Scheme == "" && u.Host == "" && u.RawQuery == "" && u.Fragment == ""
+}
+
 // getActiveCaptchaConfig returns the currently active captcha config based on circuit breaker state.
 // When circuit is open, returns the proof-of-javascript provider as a fallback.
 func (bc *CaptchaProtect) getActiveCaptchaConfig() CaptchaConfig {
@@ -520,17 +594,17 @@ func (bc *CaptchaProtect) healthCheckLoop(ctx context.Context) {
 	}
 }
 
-// performHealthCheck executes a HEAD request to the primary captcha provider's JS file
+// performHealthCheck executes a HEAD request to the primary captcha provider's health check URL
 // and updates the circuit breaker state based on the response.
 func (bc *CaptchaProtect) performHealthCheck() {
 	bc.performHealthCheckContext(context.Background())
 }
 
 func (bc *CaptchaProtect) performHealthCheckContext(parent context.Context) {
-	// Perform HEAD request to primary provider's JS URL
-	req, err := http.NewRequest(http.MethodHead, bc.captchaConfig.js, nil)
+	target := bc.captchaConfig.healthCheckURL()
+	req, err := http.NewRequest(http.MethodHead, target, nil)
 	if err != nil {
-		bc.log.Error("Failed to create health check request", "url", bc.captchaConfig.js, "err", err)
+		bc.log.Error("Failed to create health check request", "url", target, "err", err)
 		bc.recordHealthCheckFailure()
 		return
 	}
@@ -541,7 +615,7 @@ func (bc *CaptchaProtect) performHealthCheckContext(parent context.Context) {
 
 	resp, err := bc.httpClient.Do(req)
 	if err != nil {
-		bc.log.Warn("Health check failed for primary provider", "url", bc.captchaConfig.js, "err", err)
+		bc.log.Warn("Health check failed for primary provider", "url", target, "err", err)
 		bc.recordHealthCheckFailure()
 		return
 	}
@@ -552,7 +626,7 @@ func (bc *CaptchaProtect) performHealthCheckContext(parent context.Context) {
 		return
 	}
 
-	bc.log.Warn("Health check returned error status", "url", bc.captchaConfig.js, "statusCode", resp.StatusCode)
+	bc.log.Warn("Health check returned error status", "url", target, "statusCode", resp.StatusCode)
 	bc.recordHealthCheckFailure()
 }
 
@@ -609,6 +683,12 @@ func (bc *CaptchaProtect) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Serve the self-hosted Cap adapter JS
+	if bc.capJS != "" && req.URL.Path == capJSPath {
+		serveJavaScript(rw, bc.capJS)
+		return
+	}
+
 	challengeOnPage := bc.ChallengeOnPage()
 	if challengeOnPage && req.Method == http.MethodPost {
 		if req.URL.Query().Get("challenge") != "" {
@@ -653,8 +733,11 @@ func (bc *CaptchaProtect) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 // servePojJS serves the proof-of-javascript JavaScript implementation.
 // This is used as a fallback captcha provider when external providers are unavailable.
 func (bc *CaptchaProtect) servePojJS(rw http.ResponseWriter) {
-	js := helper.GetPojJS()
+	serveJavaScript(rw, helper.GetPojJS())
+}
 
+// serveJavaScript writes an uncached JavaScript response.
+func serveJavaScript(rw http.ResponseWriter, js string) {
 	rw.Header().Set("Content-Type", "application/javascript")
 	rw.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	rw.WriteHeader(http.StatusOK)
@@ -707,26 +790,44 @@ func (bc *CaptchaProtect) verifyChallengePage(rw http.ResponseWriter, req *http.
 		}
 	} else {
 		// Handle external captcha provider verification
-		var body = url.Values{}
-		body.Add("secret", bc.config.SecretKey)
-		body.Add("response", response)
-		if activeConfig.key == "cf-turnstile" {
-			idempotencyKey, err := randomUUID()
+		var reqBody io.Reader
+		contentType := "application/x-www-form-urlencoded"
+		if activeConfig.key == "cap" {
+			// Cap's siteverify API takes a JSON body.
+			payload, err := json.Marshal(map[string]string{
+				"secret":   bc.config.SecretKey,
+				"response": response,
+			})
 			if err != nil {
-				bc.log.Error("unable to create turnstile idempotency key", "err", err)
+				bc.log.Error("unable to encode cap siteverify request", "err", err)
 				http.Error(rw, "Internal error", http.StatusInternalServerError)
 				return http.StatusInternalServerError
 			}
-			body.Add("remoteip", ip)
-			body.Add("idempotency_key", idempotencyKey)
+			reqBody = bytes.NewReader(payload)
+			contentType = "application/json"
+		} else {
+			var body = url.Values{}
+			body.Add("secret", bc.config.SecretKey)
+			body.Add("response", response)
+			if activeConfig.key == "cf-turnstile" {
+				idempotencyKey, err := randomUUID()
+				if err != nil {
+					bc.log.Error("unable to create turnstile idempotency key", "err", err)
+					http.Error(rw, "Internal error", http.StatusInternalServerError)
+					return http.StatusInternalServerError
+				}
+				body.Add("remoteip", ip)
+				body.Add("idempotency_key", idempotencyKey)
+			}
+			reqBody = strings.NewReader(body.Encode())
 		}
-		validationReq, err := http.NewRequestWithContext(req.Context(), http.MethodPost, activeConfig.validate, strings.NewReader(body.Encode()))
+		validationReq, err := http.NewRequestWithContext(req.Context(), http.MethodPost, activeConfig.validate, reqBody)
 		if err != nil {
 			bc.log.Error("unable to create captcha validation request", "url", activeConfig.validate, "err", err)
 			http.Error(rw, "Internal error", http.StatusInternalServerError)
 			return http.StatusInternalServerError
 		}
-		validationReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		validationReq.Header.Set("Content-Type", contentType)
 		resp, err := bc.httpClient.Do(validationReq)
 		if err != nil {
 			bc.log.Error("unable to validate captcha", "url", activeConfig.validate, "err", err)
