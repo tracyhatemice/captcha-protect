@@ -5,6 +5,16 @@
 
 Captcha Protect is a Traefik middleware that challenges client IPs on protected routes. It can use Turnstile, reCAPTCHA, hCaptcha, proof-of-javascript, or self-hosted Cap for the challenge.
 
+## Verification by browser session
+
+Set `verificationMode: session` to require each browser session to solve its own challenge, even when several visitors share an IP address. The default is `ip` for compatibility with existing configurations. For Docker labels:
+
+```yaml
+traefik.http.middlewares.captcha-protect.plugin.captcha-protect.verificationMode: session
+```
+
+After a successful challenge, the middleware sets a host-only, HTTP-only cookie scoped to `/`. The cookie lasts for `window` seconds (one hour when the circuit breaker fallback is active). Browsers that block or clear cookies will need to solve the challenge again. A copied cookie grants the same access until it expires, so use HTTPS for protected sites. IP exemptions and bot exemptions still apply in either mode.
+
 It requires Traefik `v3.6` or above.
 
 ## Documentation

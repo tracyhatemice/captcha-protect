@@ -67,6 +67,7 @@ const (
 
 type Config struct {
 	Window            int64  `json:"window"`
+	VerificationMode  string `json:"verificationMode"`
 	IPForwardedHeader string `json:"ipForwardedHeader"`
 	IPDepth           int    `json:"ipDepth"`
 	// ProtectParameters is a string instead of bool due to Traefik's label parsing limitations
@@ -163,6 +164,7 @@ type challengeData struct {
 func CreateConfig() *Config {
 	return &Config{
 		Window:                   86400,
+		VerificationMode:         "ip",
 		IPForwardedHeader:        "",
 		ProtectParameters:        "false",
 		ProtectRoutes:            []string{},
@@ -213,6 +215,9 @@ func NewCaptchaProtect(ctx context.Context, next http.Handler, config *Config, n
 	}
 	if config.Window <= 0 {
 		return nil, fmt.Errorf("window must be positive, got %d", config.Window)
+	}
+	if config.VerificationMode != "" && config.VerificationMode != "ip" && config.VerificationMode != "session" {
+		return nil, fmt.Errorf("unknown verificationMode: %s. Supported values are ip and session", config.VerificationMode)
 	}
 
 	expiration := time.Duration(config.Window) * time.Second
@@ -875,7 +880,30 @@ func (bc *CaptchaProtect) verifyChallengePage(rw http.ResponseWriter, req *http.
 	}
 
 	if success {
-		bc.verifiedCache.Set(ip, true, exp)
+		key := ip
+		if bc.config.VerificationMode == "session" {
+			token, err := randomUUID()
+			if err != nil {
+				bc.log.Error("unable to create verification session", "err", err)
+				http.Error(rw, "Internal error", http.StatusInternalServerError)
+				return http.StatusInternalServerError
+			}
+			key = "session:" + token
+			duration := time.Duration(bc.config.Window) * time.Second
+			if exp != lru.DefaultExpiration {
+				duration = exp
+			}
+			http.SetCookie(rw, &http.Cookie{
+				Name:     bc.sessionCookieName(),
+				Value:    token,
+				Path:     "/",
+				MaxAge:   int(duration / time.Second),
+				HttpOnly: true,
+				Secure:   req.TLS != nil || req.Header.Get("X-Forwarded-Proto") == "https",
+				SameSite: http.SameSiteLaxMode,
+			})
+		}
+		bc.verifiedCache.Set(key, true, exp)
 		bc.markStateDirty()
 
 		destination := normalizeDestination(req.FormValue("destination"))
@@ -921,6 +949,12 @@ func randomUUID() (string, error) {
 		b[8], b[9],
 		b[10], b[11], b[12], b[13], b[14], b[15],
 	), nil
+}
+
+func (bc *CaptchaProtect) sessionCookieName() string {
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(bc.name))
+	return fmt.Sprintf("captcha_protect_%x", hash.Sum64())
 }
 
 func normalizeDestination(destination string) string {
@@ -993,7 +1027,14 @@ func (bc *CaptchaProtect) shouldApply(req *http.Request, clientIP string) bool {
 		return false
 	}
 
-	_, verified := bc.verifiedCache.Get(clientIP)
+	key := clientIP
+	if bc.config.VerificationMode == "session" {
+		key = ""
+		if cookie, err := req.Cookie(bc.sessionCookieName()); err == nil {
+			key = "session:" + cookie.Value
+		}
+	}
+	_, verified := bc.verifiedCache.Get(key)
 	if verified {
 		return false
 	}
