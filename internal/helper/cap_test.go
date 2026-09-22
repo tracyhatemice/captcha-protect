@@ -33,3 +33,18 @@ func TestGetCapJSEscapesCapURL(t *testing.T) {
 		t.Fatalf("expected JSON-escaped CAP_URL %q in:\n%s", want, js)
 	}
 }
+
+func TestGetCapJSSupportsDeferredExecution(t *testing.T) {
+	js := GetCapJS("/cap")
+	for _, want := range []string{
+		// data-execution="execute" defers solving to the visitor's click.
+		`var autoSolve = box.getAttribute("data-execution") !== "execute";`,
+		`if (!autoSolve) {`,
+		// a hidden widget has nothing to click, so deferred execution keeps it visible
+		`if (hidden && !autoSolve) {`,
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("expected Cap JS to contain %q", want)
+		}
+	}
+}
