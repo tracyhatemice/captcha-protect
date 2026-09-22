@@ -50,6 +50,7 @@ services:
         volumes:
             - ./tmp/cap:/etc/traefik/dynamic:ro
             - ./cap/interaction-only.tmpl.html:/etc/traefik/templates/interaction-only.tmpl.html:ro
+            - ./cap/click-to-verify.tmpl.html:/etc/traefik/templates/click-to-verify.tmpl.html:ro
             - ./../:/plugins-local/src/github.com/libops/captcha-protect:ro
         ports:
             - "${CAP_E2E_PORT:-8880}:80"

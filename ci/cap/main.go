@@ -22,6 +22,7 @@ const (
 	dynamicDir   = "tmp/cap"
 	siteIP       = "203.0.113.10"
 	app2IP       = "203.0.113.11"
+	app3IP       = "203.0.113.14"
 	bogusTokenIP = "203.0.113.12"
 	breakerIP    = "203.0.113.13"
 )
@@ -62,6 +63,11 @@ const protectedConfig = `http:
       rule: "PathPrefix(` + "`/app2`" + `)"
       service: nginx2
       middlewares: [captcha-cap-hidden]
+    app3:
+      entryPoints: [http]
+      rule: "PathPrefix(` + "`/app3`" + `)"
+      service: nginx2
+      middlewares: [captcha-cap-click]
   services:
     cap:
       loadBalancer:
@@ -108,6 +114,22 @@ const protectedConfig = `http:
           enableCommonCrawlIPCheck: "false"
           challengeURL: /app2/challenge
           challengeTmpl: /etc/traefik/templates/interaction-only.tmpl.html
+    captcha-cap-click:
+      plugin:
+        captcha-protect:
+          captchaProvider: cap
+          siteKey: "{{SITE_KEY}}"
+          secretKey: "{{SECRET_KEY}}"
+          capURL: /cap
+          capVerifyURL: http://cap:3000/cap
+          window: 120
+          ipForwardedHeader: X-Forwarded-For
+          logLevel: DEBUG
+          protectRoutes: ["/app3"]
+          goodBots: []
+          enableCommonCrawlIPCheck: "false"
+          challengeURL: /app3/challenge
+          challengeTmpl: /etc/traefik/templates/click-to-verify.tmpl.html
 `
 
 func main() {
@@ -135,6 +157,7 @@ func main() {
 	fmt.Println("Solving challenges in a real browser...")
 	compose("--profile", "browser", "run", "--rm", "browser", "visible")
 	compose("--profile", "browser", "run", "--rm", "browser", "hidden")
+	compose("--profile", "browser", "run", "--rm", "browser", "click")
 
 	fmt.Println("Checking circuit-breaker fallback to proof-of-javascript...")
 	compose("stop", "cap")
@@ -172,6 +195,12 @@ func assertHTTPChallenge(siteKey string) {
 	}
 
 	waitForRedirect(app2IP, baseURL+"/app2/", "/app2/challenge?destination=%2Fapp2%2F")
+
+	waitForRedirect(app3IP, baseURL+"/app3/", "/app3/challenge?destination=%2Fapp3%2F")
+	_, clickPage := request(app3IP, http.MethodGet, baseURL+"/app3/challenge?destination=%2Fapp3%2F", nil)
+	if !strings.Contains(clickPage, `data-execution="execute"`) {
+		fatal("click-to-verify challenge page is missing data-execution", "body", clickPage)
+	}
 }
 
 func createSiteKey() (string, string) {

@@ -22,7 +22,18 @@ It requires Traefik `v3.6` or above.
 | `capURL` | Cap's base URL as the browser sees it, e.g. `/cap` (same host) or `https://example.com/cap`; must be on the same origin as the protected site unless you configure CORS origins on the Cap site key |
 | `capVerifyURL` | Base URL the middleware uses to call Cap's siteverify from inside Traefik, e.g. `http://cap:3000/cap`. Required when `capURL` is a path; defaults to `capURL` otherwise |
 
-Cap must run with `ENABLE_ASSETS_SERVER=true` so it serves `/assets/widget.js` and `/assets/cap_wasm_bg.wasm`. The widget is visible while it solves; a custom challenge template with `data-appearance="interaction-only"` keeps it hidden. The circuit breaker (`periodSeconds` / `failureThreshold`) probes `{capVerifyURL}/assets/widget.js` and falls back to proof-of-javascript while Cap is down.
+Cap must run with `ENABLE_ASSETS_SERVER=true` so it serves `/assets/widget.js` and `/assets/cap_wasm_bg.wasm`. The circuit breaker (`periodSeconds` / `failureThreshold`) probes `{capVerifyURL}/assets/widget.js` and falls back to proof-of-javascript while Cap is down.
+
+Two attributes on the challenge template's captcha element control the widget, following Turnstile's naming:
+
+| Attribute | Value | Behaviour |
+|---|---|---|
+| `data-appearance` | `always` (default), `execute` | Widget is visible |
+| `data-appearance` | `interaction-only` | Widget is hidden |
+| `data-execution` | `render` (default), missing | Solves as soon as the widget loads |
+| `data-execution` | `execute` | Waits for the visitor to click the widget |
+
+`data-execution="execute"` needs a widget the visitor can click, so it overrides `data-appearance="interaction-only"` and logs a warning.
 
 ### Example: Cap on `/cap` behind Traefik
 
