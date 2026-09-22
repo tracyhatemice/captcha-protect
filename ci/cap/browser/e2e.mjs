@@ -4,6 +4,8 @@ const BASE = "http://localhost";
 const scenarios = {
   visible: { ip: "203.0.113.20", start: "/", challengePath: "/challenge", finalPath: "/", hidden: false },
   hidden: { ip: "203.0.113.21", start: "/app2/", challengePath: "/app2/challenge", finalPath: "/app2/", hidden: true },
+  // data-execution="execute": the widget must wait for the visitor's click
+  click: { ip: "203.0.113.22", start: "/app3/", challengePath: "/app3/challenge", finalPath: "/app3/", hidden: false, click: true },
 };
 
 const name = process.argv[2];
@@ -54,6 +56,16 @@ try {
   const display = await displayHandle.jsonValue();
   if (scenario.hidden !== (display === "none")) {
     fail(`expected widget hidden=${scenario.hidden}, got display=${display}`);
+  }
+
+  if (scenario.click) {
+    // Nothing may solve on its own: the page must still be the challenge after the widget
+    // has had time to run (a solve takes ~1s, and the template submits 1s after that).
+    await page.waitForTimeout(6_000);
+    if (new URL(page.url()).pathname !== scenario.challengePath) {
+      fail(`widget solved without a click; expected to stay on ${scenario.challengePath}, got ${page.url()}`);
+    }
+    await page.locator("cap-widget .captcha-trigger").click({ timeout: 15_000 });
   }
 
   await page.waitForURL((url) => url.pathname === scenario.finalPath, { timeout: 60_000 });

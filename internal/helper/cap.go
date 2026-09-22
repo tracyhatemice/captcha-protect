@@ -39,10 +39,19 @@ const capJSBody = `
             form.appendChild(input);
         }
 
+        // Like Turnstile's data-execution: "render" (default) solves as soon as the widget
+        // loads, "execute" waits for the visitor to click it.
+        var autoSolve = box.getAttribute("data-execution") !== "execute";
+        // Cap never needs interaction, so interaction-only means the widget is never shown.
+        var hidden = box.getAttribute("data-appearance") === "interaction-only";
+        if (hidden && !autoSolve) {
+            console.warn('Cap: data-execution="execute" needs a visible widget; ignoring data-appearance="interaction-only"');
+            hidden = false;
+        }
+
         var widget = document.createElement("cap-widget");
         widget.setAttribute("data-cap-api-endpoint", CAP_URL + "/" + encodeURIComponent(siteKey) + "/");
-        // Cap never needs interaction, so interaction-only means the widget is never shown.
-        if (box.getAttribute("data-appearance") === "interaction-only") {
+        if (hidden) {
             widget.style.display = "none";
         }
         widget.addEventListener("solve", function(e) {
@@ -58,6 +67,10 @@ const capJSBody = `
         var script = document.createElement("script");
         script.src = CAP_URL + "/assets/widget.js";
         script.onload = function() {
+            if (!autoSolve) {
+                // the widget's own checkbox starts the challenge
+                return;
+            }
             customElements.whenDefined("cap-widget").then(function() {
                 return widget.solve();
             }).catch(function(e) {
