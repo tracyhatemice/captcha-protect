@@ -46,12 +46,12 @@ services:
             --entryPoints.http.forwardedHeaders.insecure=true
             --providers.file.directory=/etc/traefik/dynamic
             --providers.file.watch=true
-            --experimental.localPlugins.captcha-protect.moduleName=github.com/libops/captcha-protect
+            --experimental.localPlugins.captcha-protect.moduleName=github.com/tracyhatemice/captcha-protect
         volumes:
             - ./tmp/cap:/etc/traefik/dynamic:ro
             - ./cap/interaction-only.tmpl.html:/etc/traefik/templates/interaction-only.tmpl.html:ro
             - ./cap/click-to-verify.tmpl.html:/etc/traefik/templates/click-to-verify.tmpl.html:ro
-            - ./../:/plugins-local/src/github.com/libops/captcha-protect:ro
+            - ./../:/plugins-local/src/github.com/tracyhatemice/captcha-protect:ro
         ports:
             - "${CAP_E2E_PORT:-8880}:80"
         healthcheck:

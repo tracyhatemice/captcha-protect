@@ -8,10 +8,34 @@ on:
 jobs:
   release:
     if: github.event.pull_request.merged == true && !contains(github.event.pull_request.title, 'skip-release')
-    uses: libops/actions/.github/workflows/bump-release.yaml@ef667db8c16533a257d841e75df5c3388152b2d7 # main
-    with:
-      prefix: v
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
-      actions: write
-    secrets: inherit
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: install autotag binary
+        run: |
+          gh release download "$TAG" --repo "$REPO" --pattern "$BINARY"
+          echo "$SHA256  $BINARY" | shasum -a 256 -c
+
+          chmod +x "$BINARY"
+          sudo mv "$BINARY" /usr/bin/autotag
+        env:
+          REPO: autotag-dev/autotag
+          BINARY: autotag_linux_amd64
+          TAG: v1.4.1
+          SHA256: 7b34c34316b8dd57b43ca0b08454ba57baf6472bef4e5ea46215b6ef5cd96146
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump git tag and create GitHub Release
+        run: |-
+          TAG="v$(autotag)"
+          git tag "$TAG" || echo continue
+          git push origin "$TAG"
+          gh release create "$TAG" --title "$TAG" --generate-notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/libops/captcha-protect/internal/helper"
 	lru "github.com/patrickmn/go-cache"
+	"github.com/tracyhatemice/captcha-protect/internal/helper"
 )
 
 const ciRootSmokeIP = "192.0.2.10"

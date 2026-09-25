@@ -1,7 +1,7 @@
 displayName: Captcha Protect
 summary: Add an anti-bot challenge to protected routes
 type: middleware
-import: github.com/libops/captcha-protect
+import: github.com/tracyhatemice/captcha-protect
 testData:
   ProtectRoutes: /
   ChallengeTmpl: challenge.tmpl.html

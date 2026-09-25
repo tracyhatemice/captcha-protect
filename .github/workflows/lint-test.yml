@@ -26,7 +26,7 @@ jobs:
       - name: check Traefik module path
         run: |
           module_path="$(go list -m)"
-          test "$module_path" = "github.com/libops/captcha-protect"
+          test "$module_path" = "github.com/tracyhatemice/captcha-protect"
           test "$(yq '.import' .traefik.yml)" = "$module_path"
 
       - name: go mod tidy
@@ -50,14 +50,6 @@ jobs:
 
       - name: generate coverage
         run: go test -skip 'TestStateOperationsWithinThreshold' -coverprofile=coverage.out -covermode=atomic $(go list ./... | grep -v '/ci') || echo continue
-
-      - name: upload coverage to codecov
-        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
-        with:
-          files: ./coverage.out
-          fail_ci_if_error: false
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   integration-test-labels:
     needs: [run]

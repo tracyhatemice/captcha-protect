@@ -1,7 +1,6 @@
 # Captcha Protect
 
-[![lint-test](https://github.com/libops/captcha-protect/actions/workflows/lint-test.yml/badge.svg)](https://github.com/libops/captcha-protect/actions/workflows/lint-test.yml)
-[![codecov](https://codecov.io/gh/libops/captcha-protect/branch/main/graph/badge.svg)](https://codecov.io/gh/libops/captcha-protect)
+[![lint-test](https://github.com/tracyhatemice/captcha-protect/actions/workflows/lint-test.yml/badge.svg)](https://github.com/tracyhatemice/captcha-protect/actions/workflows/lint-test.yml)
 
 Captcha Protect is a Traefik middleware that challenges client IPs on protected routes. It can use Turnstile, reCAPTCHA, hCaptcha, proof-of-javascript, or self-hosted Cap for the challenge.
 
