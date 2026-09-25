@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/libops/captcha-protect/internal/helper"
+	"github.com/tracyhatemice/captcha-protect/internal/helper"
 )
 
 func TestRouteIsProtected(t *testing.T) {
