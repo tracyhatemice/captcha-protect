@@ -31,8 +31,11 @@ const browser = await chromium.launch();
 try {
   const context = await browser.newContext({ extraHTTPHeaders: { "X-Forwarded-For": scenario.ip } });
   const external = [];
+  const capAssets = [];
   context.on("request", (request) => {
     if (hostOf(request.url()) !== "localhost") external.push(request.url());
+    const url = new URL(request.url());
+    if (url.pathname.startsWith("/cap/assets/")) capAssets.push(url);
   });
   const page = await context.newPage();
   page.on("console", (msg) => console.log(`[browser:${msg.type()}] ${msg.text()}`));
@@ -81,6 +84,16 @@ try {
 
   if (external.length > 0) {
     fail(`browser contacted non-local hosts: ${external.join(", ")}`);
+  }
+
+  // captcha-protect versions the widget and its wasm by the widget's hash, so a browser
+  // holding a copy cached under an older URL fetches the current one instead.
+  if (!capAssets.some((url) => url.pathname === "/cap/assets/widget.js")) {
+    fail("the Cap widget script was never requested");
+  }
+  const unversioned = capAssets.filter((url) => !/^[0-9a-f]{16}$/.test(url.searchParams.get("v") ?? ""));
+  if (unversioned.length > 0) {
+    fail(`Cap assets requested without a version: ${unversioned.join(", ")}`);
   }
   console.log(`✓ [${name}] solved the Cap challenge and reached ${scenario.finalPath}`);
 } finally {

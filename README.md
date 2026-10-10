@@ -31,7 +31,14 @@ It requires Traefik `v3.6` or above.
 | `capURL` | Cap's base URL as the browser sees it, e.g. `/cap` (same host) or `https://example.com/cap`; must be on the same origin as the protected site unless you configure CORS origins on the Cap site key |
 | `capVerifyURL` | Base URL the middleware uses to call Cap's siteverify from inside Traefik, e.g. `http://cap:3000/cap`. Required when `capURL` is a path; defaults to `capURL` otherwise |
 
-Cap must run with `ENABLE_ASSETS_SERVER=true` so it serves `/assets/widget.js` and `/assets/cap_wasm_bg.wasm`. The circuit breaker (`periodSeconds` / `failureThreshold`) probes `{capVerifyURL}/assets/widget.js` and falls back to proof-of-javascript while Cap is down.
+Cap must run with `ENABLE_ASSETS_SERVER=true` so it serves `/assets/widget.js`, `/assets/cap_wasm_bg.wasm` and `/assets/hashwx.wasm`. The circuit breaker (`periodSeconds` / `failureThreshold`) probes `{capVerifyURL}/assets/widget.js` and falls back to proof-of-javascript while Cap is down.
+
+The middleware fetches `{capVerifyURL}/assets/widget.js` when Traefik loads it, at startup and on every configuration reload, and adds the first 16 hex characters of its SHA-256 to the widget and WASM URLs as `?v=`. When Cap is upgraded the URLs change, so browsers download the new files instead of reusing a cached copy, including one cached under the `immutable` header older Cap images sent. `periodSeconds` decides when the widget is fetched again:
+
+- `0` (the default): never. A Cap upgrade changes the URLs at the next reload or restart, and if the fetch at load fails, the URLs carry no version until then.
+- Above `0`: every `periodSeconds`, so a Cap upgrade changes the URLs without a reload. A failed fetch keeps the last version.
+
+`failureThreshold` does not affect this.
 
 Two attributes on the challenge template's captcha element control the widget, following Turnstile's naming:
 
