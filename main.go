@@ -114,7 +114,9 @@ type CaptchaProtect struct {
 	commonCrawlIPs     *helper.CommonCrawlIPs
 	uptimeRobotIPs     *helper.UptimeRobotIPs
 	captchaConfig      CaptchaConfig
+	capMu              sync.RWMutex
 	capJS              string
+	capWidgetVersion   string
 	exemptIps          []*net.IPNet
 	tmpl               *htemplate.Template
 	protectRoutesRegex []*regexp.Regexp
@@ -349,7 +351,7 @@ func NewCaptchaProtect(ctx context.Context, next http.Handler, config *Config, n
 			return nil, err
 		}
 		bc.captchaConfig = capConfig
-		bc.capJS = helper.GetCapJS(config.CapURL)
+		bc.capJS = helper.GetCapJS(config.CapURL, "")
 	} else {
 		bc.captchaConfig = getCaptchaConfig(config.CaptchaProvider)
 	}
@@ -388,6 +390,9 @@ func NewCaptchaProtect(ctx context.Context, next http.Handler, config *Config, n
 		log.Info("UptimeRobot bypass enabled")
 		bc.uptimeRobotIPs = helper.NewUptimeRobotIPs()
 		go uptimeRobotIPCheckLoop(ctx, log, bc.httpClient, bc.uptimeRobotIPs)
+	}
+	if config.CaptchaProvider == "cap" {
+		go bc.capWidgetVersionLoop(ctx, time.Duration(config.PeriodSeconds)*time.Second)
 	}
 
 	return &bc, nil
@@ -579,6 +584,68 @@ func (bc *CaptchaProtect) getActiveCaptchaConfig() CaptchaConfig {
 	return bc.captchaConfig
 }
 
+// capWidgetVersionLoop versions the adapter's asset URLs by the widget Cap serves. It hashes
+// the widget when the middleware loads and then every period. A period of zero or less
+// hashes only once, so the version holds until Traefik reloads the middleware.
+func (bc *CaptchaProtect) capWidgetVersionLoop(ctx context.Context, period time.Duration) {
+	if ctx.Err() != nil {
+		return
+	}
+	bc.refreshCapWidgetVersion(ctx)
+
+	if period <= 0 {
+		bc.capMu.RLock()
+		unversioned := bc.capWidgetVersion == ""
+		bc.capMu.RUnlock()
+		if unversioned {
+			bc.log.Warn("Cap asset URLs stay unversioned until the middleware reloads; set periodSeconds to retry")
+		}
+		return
+	}
+
+	ticker := time.NewTicker(period)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			bc.refreshCapWidgetVersion(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// refreshCapWidgetVersion hashes the widget Cap serves and rebuilds the adapter when the
+// hash changes, so browsers fetch the widget and WASM again instead of reusing a cached
+// copy. A failed fetch keeps the last version.
+func (bc *CaptchaProtect) refreshCapWidgetVersion(ctx context.Context) {
+	widgetURL := bc.config.CapVerifyURL + "/assets/widget.js"
+	version, err := helper.FetchCapWidgetVersion(ctx, bc.httpClient, widgetURL)
+	if err != nil {
+		bc.log.Warn("Unable to fetch the Cap widget version", "url", widgetURL, "err", err)
+		return
+	}
+
+	bc.capMu.Lock()
+	previous := bc.capWidgetVersion
+	if version != previous {
+		bc.capWidgetVersion = version
+		bc.capJS = helper.GetCapJS(bc.config.CapURL, version)
+	}
+	bc.capMu.Unlock()
+
+	if version != previous {
+		bc.log.Info("Cap widget version changed", "version", version, "previous", previous)
+	}
+}
+
+// capAdapterJS returns the Cap adapter script, or "" when the provider is not Cap.
+func (bc *CaptchaProtect) capAdapterJS() string {
+	bc.capMu.RLock()
+	defer bc.capMu.RUnlock()
+	return bc.capJS
+}
+
 // healthCheckLoop periodically checks the health of the primary captcha provider.
 // If consecutive failures exceed the threshold, it opens the circuit to use the fallback provider.
 func (bc *CaptchaProtect) healthCheckLoop(ctx context.Context) {
@@ -689,9 +756,11 @@ func (bc *CaptchaProtect) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	// Serve the self-hosted Cap adapter JS
-	if bc.capJS != "" && req.URL.Path == capJSPath {
-		serveJavaScript(rw, bc.capJS)
-		return
+	if req.URL.Path == capJSPath {
+		if js := bc.capAdapterJS(); js != "" {
+			serveJavaScript(rw, js)
+			return
+		}
 	}
 
 	challengeOnPage := bc.ChallengeOnPage()
