@@ -7,7 +7,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func newCapTestConfig(capURL, capVerifyURL string) *Config {
@@ -113,9 +115,15 @@ func TestStaticProvidersHealthCheckTheirScript(t *testing.T) {
 }
 
 func TestCapHealthCheckTargetsWidgetAsset(t *testing.T) {
-	requests := make(chan string, 1)
+	var mu sync.Mutex
+	var heads []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests <- r.Method + " " + r.URL.Path
+		// The middleware also GETs the widget in the background to version its URL.
+		if r.Method == http.MethodHead {
+			mu.Lock()
+			heads = append(heads, r.URL.Path)
+			mu.Unlock()
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
@@ -132,8 +140,11 @@ func TestCapHealthCheckTargetsWidgetAsset(t *testing.T) {
 	bc.recordHealthCheckFailure() // threshold 1: opens the circuit
 	bc.performHealthCheck()
 
-	if got := <-requests; got != "HEAD /cap/assets/widget.js" {
-		t.Fatalf("health check request = %q, want %q", got, "HEAD /cap/assets/widget.js")
+	mu.Lock()
+	got := heads
+	mu.Unlock()
+	if len(got) != 1 || got[0] != "/cap/assets/widget.js" {
+		t.Fatalf("health check HEAD requests = %q, want [/cap/assets/widget.js]", got)
 	}
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
@@ -210,6 +221,11 @@ func newCapSiteverifyServer(t *testing.T, status int, response string) (*httptes
 	t.Helper()
 	calls := make(chan capSiteverifyCall, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/cap/assets/widget.js" {
+			// the background widget version fetch, not a siteverify call
+			http.NotFound(w, r)
+			return
+		}
 		var body map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		calls <- capSiteverifyCall{method: r.Method, path: r.URL.Path, contentType: r.Header.Get("Content-Type"), body: body}
@@ -310,5 +326,150 @@ func TestCapVerifyRequiresCapResponse(t *testing.T) {
 
 	if status != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", status)
+	}
+}
+
+// fakeCapAssets serves a Cap widget script whose status and body a test can change.
+type fakeCapAssets struct {
+	mu     sync.Mutex
+	status int
+	body   string
+}
+
+func (f *fakeCapAssets) set(status int, body string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.status, f.body = status, body
+}
+
+func (f *fakeCapAssets) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet || r.URL.Path != "/cap/assets/widget.js" {
+		http.NotFound(w, r)
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	w.WriteHeader(f.status)
+	_, _ = w.Write([]byte(f.body))
+}
+
+func capAdapter(t *testing.T, bc *CaptchaProtect) string {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	bc.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, capJSPath, nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("adapter status = %d, want 200", rr.Code)
+	}
+	return rr.Body.String()
+}
+
+// waitForCapAdapter waits for the startup fetch to put want into the adapter.
+func waitForCapAdapter(t *testing.T, bc *CaptchaProtect, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(capAdapter(t, bc), want) {
+		if time.Now().After(deadline) {
+			t.Fatalf("adapter never contained %q:\n%s", want, capAdapter(t, bc))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Hashes are the first 16 hex characters of sha256sum over the fixture bodies.
+const (
+	capWidgetV1     = "cap widget v1\n"
+	capWidgetV1Hash = "37a5d4c1917cf499"
+	capWidgetV2     = "cap widget v2\n"
+	capWidgetV2Hash = "33de2f23e1772c2a"
+)
+
+func TestCapAdapterVersionsAssetsByWidgetHash(t *testing.T) {
+	assets := &fakeCapAssets{status: http.StatusOK, body: capWidgetV1}
+	server := httptest.NewServer(assets)
+	defer server.Close()
+
+	bc, err := NewCaptchaProtect(t.Context(), http.NotFoundHandler(), newCapTestConfig("/cap", server.URL+"/cap"), "test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	waitForCapAdapter(t, bc, `var WIDGET_URL = "/cap/assets/widget.js?v=`+capWidgetV1Hash+`";`)
+	js := capAdapter(t, bc)
+	for _, want := range []string{
+		`var WASM_URL = "/cap/assets/cap_wasm_bg.wasm?v=` + capWidgetV1Hash + `";`,
+		`var HASHWX_URL = "/cap/assets/hashwx.wasm?v=` + capWidgetV1Hash + `";`,
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("expected the WASM URLs to carry the widget hash, missing %q:\n%s", want, js)
+		}
+	}
+
+	assets.set(http.StatusOK, capWidgetV2)
+	bc.refreshCapWidgetVersion(t.Context())
+
+	js = capAdapter(t, bc)
+	for _, want := range []string{
+		`var WIDGET_URL = "/cap/assets/widget.js?v=` + capWidgetV2Hash + `";`,
+		`var WASM_URL = "/cap/assets/cap_wasm_bg.wasm?v=` + capWidgetV2Hash + `";`,
+		`var HASHWX_URL = "/cap/assets/hashwx.wasm?v=` + capWidgetV2Hash + `";`,
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("after the widget changed, expected adapter to contain %q:\n%s", want, js)
+		}
+	}
+}
+
+func TestCapAdapterKeepsVersionWhenWidgetFetchFails(t *testing.T) {
+	tests := []struct {
+		name string
+		fail func(assets *fakeCapAssets, server *httptest.Server)
+	}{
+		{"error status", func(assets *fakeCapAssets, _ *httptest.Server) { assets.set(http.StatusBadGateway, "bad gateway") }},
+		{"unreachable", func(_ *fakeCapAssets, server *httptest.Server) { server.Close() }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assets := &fakeCapAssets{status: http.StatusOK, body: capWidgetV1}
+			server := httptest.NewServer(assets)
+			defer server.Close()
+
+			bc, err := NewCaptchaProtect(t.Context(), http.NotFoundHandler(), newCapTestConfig("/cap", server.URL+"/cap"), "test")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			want := `var WIDGET_URL = "/cap/assets/widget.js?v=` + capWidgetV1Hash + `";`
+			waitForCapAdapter(t, bc, want)
+
+			tt.fail(assets, server)
+			bc.refreshCapWidgetVersion(t.Context())
+
+			if js := capAdapter(t, bc); !strings.Contains(js, want) {
+				t.Fatalf("expected the last good version to be kept, got:\n%s", js)
+			}
+		})
+	}
+}
+
+func TestCapAdapterUnversionedUntilWidgetFetched(t *testing.T) {
+	assets := &fakeCapAssets{status: http.StatusServiceUnavailable, body: "starting"}
+	server := httptest.NewServer(assets)
+	defer server.Close()
+
+	bc, err := NewCaptchaProtect(t.Context(), http.NotFoundHandler(), newCapTestConfig("/cap", server.URL+"/cap"), "test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	bc.refreshCapWidgetVersion(t.Context())
+
+	js := capAdapter(t, bc)
+	for _, want := range []string{
+		`var WIDGET_URL = "/cap/assets/widget.js";`,
+		`var WASM_URL = "/cap/assets/cap_wasm_bg.wasm";`,
+		`var HASHWX_URL = "/cap/assets/hashwx.wasm";`,
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("expected adapter to contain %q:\n%s", want, js)
+		}
 	}
 }

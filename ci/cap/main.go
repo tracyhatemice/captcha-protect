@@ -3,7 +3,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -183,10 +185,14 @@ func assertHTTPChallenge(siteKey string) {
 		fatal("adapter script not served", "status", resp.StatusCode, "contentType", resp.Header.Get("Content-Type"))
 	}
 
-	resp, _ = request(siteIP, http.MethodGet, baseURL+"/cap/assets/widget.js", nil)
+	resp, widget := request(siteIP, http.MethodGet, baseURL+"/cap/assets/widget.js", nil)
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Location") != "" {
 		fatal("cap widget asset must be reachable without a challenge", "status", resp.StatusCode, "location", resp.Header.Get("Location"))
 	}
+
+	// The adapter names the widget by its hash, so browsers never reuse a stale cached copy.
+	sum := sha256.Sum256([]byte(widget))
+	waitForBodyContains(siteIP, baseURL+"/captcha-protect-cap.js", `var WIDGET_URL = "/cap/assets/widget.js?v=`+hex.EncodeToString(sum[:])[:16]+`";`)
 
 	form := url.Values{"cap-response": {siteKey + ":bogus:token"}, "destination": {"/"}}
 	resp, _ = request(bogusTokenIP, http.MethodPost, baseURL+"/challenge", form)
